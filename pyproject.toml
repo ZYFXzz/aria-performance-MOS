@@ -16,6 +16,7 @@ dependencies = [
     "safetensors",
     "jsonlines",
     "tqdm",
+    "wandb",
 ]
 
 [project.optional-dependencies]

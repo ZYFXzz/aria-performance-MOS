@@ -7,6 +7,8 @@ import random
 import copy
 import accelerate
 import json
+import time
+import wandb
 
 from aria.config import load_model_config
 from aria.utils import _load_weight
@@ -46,6 +48,18 @@ def setup_logger(project_dir: str):
     logger.addHandler(ch)
 
     return get_logger(__name__)
+
+
+def setup_wandb(project_dir: str, model_name: str, config: dict):
+    """Setup Weights & Biases logging"""
+    wandb.init(
+        project="aria-contrastive-finetune",
+        name=f"{model_name}_{os.path.basename(project_dir)}",
+        config=config,
+        dir=project_dir,
+        tags=["contrastive-learning", "music", "embedding"],
+    )
+    return wandb
 
 
 def setup_project_dir(project_dir: str | None):
@@ -363,6 +377,7 @@ def _train(
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.LRScheduler = None,
     project_dir: str | None = None,
+    wandb_run = None,
 ):
     def make_checkpoint(
         _accelerator: accelerate.Accelerator, _epoch: int, _step: int
@@ -388,6 +403,11 @@ def _train(
         avg_train_loss = 0
         trailing_loss = 0
         loss_buffer = []
+        
+        # Timing and speed tracking
+        epoch_start_time = time.time()
+        step_times = []
+        total_samples_processed = 0
 
         try:
             lr_for_print = "{:.2e}".format(scheduler.get_last_lr()[0])
@@ -405,6 +425,8 @@ def _train(
                 leave=False,
             )
         ):
+            step_start_time = time.time()
+            
             pbar.set_postfix_str(
                 f"lr={lr_for_print}, "
                 f"loss={round(loss.item(), 4)}, "
@@ -439,14 +461,38 @@ def _train(
                 )
                 avg_train_loss = sum(loss_buffer) / len(loss_buffer)
 
+                # Calculate timing and speed metrics
+                step_time = time.time() - step_start_time
+                step_times.append(step_time)
+                total_samples_processed += seqs.size(0)
+                
+                # Calculate current speed metrics
+                avg_step_time = sum(step_times) / len(step_times)
+                samples_per_second = total_samples_processed / (time.time() - epoch_start_time)
+                
                 # Logging
                 logger.debug(
                     f"EPOCH {_epoch} STEP {step}: "
                     f"lr={lr_for_print}, "
                     f"loss={round(loss.item(), 4)}, "
                     f"trailing_loss={round(trailing_loss, 4)}, "
-                    f"average_loss={round(avg_train_loss, 4)}"
+                    f"average_loss={round(avg_train_loss, 4)}, "
+                    f"step_time={round(step_time, 4)}s, "
+                    f"avg_step_time={round(avg_step_time, 4)}s, "
+                    f"samples_per_sec={round(samples_per_second, 2)}"
                 )
+                
+                # Log to wandb
+                if wandb_run is not None:
+                    wandb_run.log({
+                        "train/step_loss": loss.item(),
+                        "train/step_time": step_time,
+                        "train/avg_step_time": avg_step_time,
+                        "train/samples_per_second": samples_per_second,
+                        "train/learning_rate": float(scheduler.get_last_lr()[0]) if scheduler else float(optimizer.param_groups[-1]["lr"]),
+                        "train/step": step,
+                        "train/epoch": _epoch,
+                    })
 
                 accelerator.backward(loss)
                 optimizer.step()
@@ -462,6 +508,30 @@ def _train(
                             _epoch=_epoch,
                             _step=step,
                         )
+
+        # Calculate epoch-level metrics
+        epoch_time = time.time() - epoch_start_time
+        avg_epoch_time = epoch_time
+        total_samples_per_epoch = total_samples_processed
+        
+        # Log epoch summary
+        logger.info(
+            f"EPOCH {_epoch} SUMMARY: "
+            f"avg_loss={round(avg_train_loss, 4)}, "
+            f"epoch_time={round(epoch_time, 2)}s, "
+            f"total_samples={total_samples_per_epoch}, "
+            f"avg_samples_per_sec={round(total_samples_per_epoch/epoch_time, 2)}"
+        )
+        
+        # Log epoch metrics to wandb
+        if wandb_run is not None:
+            wandb_run.log({
+                "train/epoch_loss": avg_train_loss,
+                "train/epoch_time": epoch_time,
+                "train/epoch_samples": total_samples_per_epoch,
+                "train/epoch_samples_per_second": total_samples_per_epoch/epoch_time,
+                "train/epoch": _epoch,
+            })
 
         return avg_train_loss
 
@@ -506,6 +576,14 @@ def _train(
         logger.info(
             f"Validation Epoch {_epoch}: average_loss={round(avg_val_loss, 4)}"
         )
+        
+        # Log validation metrics to wandb
+        if wandb_run is not None:
+            wandb_run.log({
+                "val/epoch_loss": avg_val_loss,
+                "val/epoch": _epoch,
+            })
+            
         return avg_val_loss
 
     logger = get_logger(__name__)
@@ -538,10 +616,21 @@ def train(
     if accelerator.is_main_process:
         project_dir = setup_project_dir(project_dir)
         logger = setup_logger(os.path.join(project_dir))
+        # Setup wandb logging
+        training_config = {
+            "model_name": model_name,
+            "num_epochs": num_epochs,
+            "batch_size": batch_size,
+            "num_workers": num_workers,
+            "grad_acc_steps": grad_acc_steps,
+            "checkpoint_path": checkpoint_path,
+        }
+        wandb_run = setup_wandb(project_dir, model_name, training_config)
     else:
         # In other processes, we won't create logs
         project_dir = project_dir or "./experiments"
         logger = get_logger(__name__)
+        wandb_run = None
 
     logger.info(f"Project directory: {project_dir}")
     logger.info(
@@ -599,7 +688,12 @@ def train(
         optimizer=optimizer,
         scheduler=scheduler,
         project_dir=project_dir,
+        wandb_run=wandb_run,
     )
+    
+    # Finish wandb run
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 def test_dataset():
